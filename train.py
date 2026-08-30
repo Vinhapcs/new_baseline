@@ -17,7 +17,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, build_rotation  # IMGS_BUILD_ROTATION_IMPORT_PATCH
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -45,6 +45,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    # IMGS_FIELD_LOAD_PATCH
+    implicit_metric_field = None
+    metric_stats_history = []
+    if os.environ.get("IMPLICIT_METRIC_ENABLED", "0") == "1":
+        from implicit_metric_field import load_metric_field
+        implicit_metric_field = load_metric_field(
+            os.environ["IMPLICIT_METRIC_CKPT"], device="cuda"
+        )
+        print("IMGS_FIELD_LOADED", os.environ["IMPLICIT_METRIC_CKPT"])
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -62,6 +72,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        # IMGS_GEOMETRY_FREEZE_PATCH
+        freeze_after = int(os.environ.get("IMGS_FREEZE_GEOMETRY_AFTER", "0"))
+        if freeze_after > 0 and iteration > freeze_after:
+            for param_group in gaussians.optimizer.param_groups:
+                if param_group.get("name") in ("xyz", "scaling", "rotation"):
+                    param_group["lr"] = 0.0
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -85,16 +102,98 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ssim_value = ssim(image, gt_image)
         loss = Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         
+        # IMGS_ALIGNMENT_LOSS_PATCH
+        if (
+            implicit_metric_field is not None
+            and os.environ.get("IMPLICIT_METRIC_ALIGN", "0") == "1"
+        ):
+            align_start = int(os.environ.get("IMPLICIT_METRIC_ALIGN_START", "1000"))
+            align_end = int(os.environ.get("IMPLICIT_METRIC_ALIGN_END", "5000"))
+            if iteration >= align_start and iteration <= align_end:
+                from implicit_metric_field import metric_strength
+                align_strength = metric_strength(
+                    iteration,
+                    int(os.environ.get("IMPLICIT_METRIC_START", "1000")),
+                    int(os.environ.get("IMPLICIT_METRIC_END", "5500")),
+                    int(os.environ.get("IMPLICIT_METRIC_RAMP", "750")),
+                )
+                sample_count = min(
+                    int(os.environ.get("IMPLICIT_METRIC_ALIGN_SAMPLES", "8192")),
+                    int(gaussians._xyz.shape[0]),
+                )
+                if sample_count > 0 and align_strength > 0:
+                    ids = torch.randint(
+                        0, gaussians._xyz.shape[0],
+                        (sample_count,), device=gaussians._xyz.device
+                    )
+                    with torch.no_grad():
+                        normal_target, align_trust = implicit_metric_field(
+                            gaussians._xyz.detach()[ids]
+                        )
+                    rot = build_rotation(gaussians._rotation[ids])
+                    scales = gaussians.get_scaling[ids]
+                    shortest = torch.argmin(scales, dim=-1)
+                    gather_idx = shortest[:, None, None].expand(-1, 3, 1)
+                    shortest_axis = torch.gather(rot, 2, gather_idx).squeeze(-1)
+                    cos2 = (shortest_axis * normal_target).sum(
+                        dim=-1, keepdim=True
+                    ).pow(2)
+                    align_loss = (
+                        align_trust.detach() * (1.0 - cos2)
+                    ).sum() / (align_trust.detach().sum() + 1e-8)
+                    loss = loss + (
+                        float(os.environ.get(
+                            "IMPLICIT_METRIC_ALIGN_LAMBDA", "0.005"
+                        ))
+                        * float(align_strength)
+                        * align_loss
+                    )
+
         loss.backward()
+
+        # IMGS_GRADIENT_METRIC_PATCH
+        if implicit_metric_field is not None:
+            from implicit_metric_field import (
+                metric_strength,
+                transform_xyz_gradient_evidence_inplace,
+            )
+            metric_s = metric_strength(
+                iteration,
+                int(os.environ.get("IMPLICIT_METRIC_START", "1000")),
+                int(os.environ.get("IMPLICIT_METRIC_END", "5500")),
+                int(os.environ.get("IMPLICIT_METRIC_RAMP", "750")),
+            )
+            metric_stats = transform_xyz_gradient_evidence_inplace(
+                gaussians=gaussians,
+                field=implicit_metric_field,
+                strength=metric_s,
+                rho_min=float(os.environ.get("IMPLICIT_METRIC_RHO_MIN", "0.05")),
+                trust_threshold=float(os.environ.get("EC_TRUST_THRESHOLD", "0.78")),
+                trust_temperature=float(os.environ.get("EC_TRUST_TEMPERATURE", "0.08")),
+                normal_need_beta=float(os.environ.get("EC_NORMAL_NEED_BETA", "0.35")),
+                normal_need_clip=float(os.environ.get("EC_NORMAL_NEED_CLIP", "3.0")),
+                chunk_size=int(os.environ.get("IMPLICIT_METRIC_CHUNK", "65536")),
+            )
+            log_interval = int(os.environ.get("IMPLICIT_METRIC_LOG_INTERVAL", "100"))
+            if metric_s > 0 and iteration % max(log_interval, 1) == 0:
+                metric_stats_history.append({
+                    "iteration": int(iteration),
+                    "strength": float(metric_s),
+                    "mode": "evidence",
+                    **metric_stats,
+                })
         iter_end.record()
 
         with torch.no_grad():
             # STEREOGS_ADAPTIVE_OPACITY_DECAY_TRAIN_PATCH
+            # IMGS_OPACITY_DECAY_WINDOW_PATCH
             if os.environ.get("STEREOGS_OPACITY_DECAY_ENABLED", "0") == "1":
-                gaussians.adaptive_opacity_decay(
-                    min_decay_rate=float(os.environ.get("STEREOGS_OPACITY_DECAY_FACTOR", "0.99")),
-                    sensitivity=float(os.environ.get("STEREOGS_GRAD_SENSITIVITY", "0.5")),
-                )
+                decay_end = int(os.environ.get("STEREOGS_OPACITY_DECAY_END", "0"))
+                if decay_end <= 0 or iteration <= decay_end:
+                    gaussians.adaptive_opacity_decay(
+                        min_decay_rate=float(os.environ.get("STEREOGS_OPACITY_DECAY_FACTOR", "0.99")),
+                        sensitivity=float(os.environ.get("STEREOGS_GRAD_SENSITIVITY", "0.5")),
+                    )
 
             # Progress bar
             if iteration > opt.densify_from_iter:
@@ -112,6 +211,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+
+                # IMGS_METRIC_STATS_SAVE_PATCH
+                if implicit_metric_field is not None:
+                    stats_path = os.path.join(
+                        scene.model_path, "imgs_metric_stats_{}.pt".format(iteration)
+                    )
+                    torch.save(metric_stats_history, stats_path)
 
             # Densification
             if iteration < opt.densify_until_iter:
