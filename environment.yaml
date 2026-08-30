@@ -1,0 +1,22 @@
+name: DropGaussian
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.10
+  - pip=25.0
+  - pytorch=2.5.1=py3.10_cuda12.1_cudnn9.1.0_0
+  - pytorch-cuda=12.1=ha16c6d3_6
+  - pytorch-mutex=1.0=cuda
+  - torchaudio=2.5.1=py310_cu121
+  - torchvision=0.20.1=py310_cu121
+  - tqdm
+  - pip:
+    - plyfile
+    - submodules/diff-gaussian-rasterization
+    - submodules/simple-knn
+    - matplotlib
+    - torchmetrics==1.2.0
+    - opencv_python
+    - scipy
