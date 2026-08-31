@@ -3,6 +3,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+
 class ImplicitMetricField(nn.Module):
     def __init__(self, center, scale, fourier_levels=6, hidden=96, layers=4):
         super().__init__()
@@ -53,6 +54,7 @@ class ImplicitMetricField(nn.Module):
             "layers": self.layers,
         }
 
+
 def load_metric_field(path, device="cuda"):
     try:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -69,6 +71,7 @@ def load_metric_field(path, device="cuda"):
         p.requires_grad_(False)
     return field
 
+
 def metric_strength(iteration, start, end, ramp):
     if iteration < start or iteration > end:
         return 0.0
@@ -78,18 +81,44 @@ def metric_strength(iteration, start, end, ramp):
     down = min(max((end - iteration) / float(ramp), 0.0), 1.0)
     return min(up, down)
 
+
 @torch.no_grad()
-def transform_xyz_gradient_inplace(gaussians, field, strength, rho_min=0.05, chunk_size=65536):
+def transform_xyz_gradient_inplace(
+    gaussians,
+    field,
+    strength,
+    rho_min=0.05,
+    chunk_size=65536,
+):
     grad = gaussians._xyz.grad
     if grad is None or strength <= 0:
-        return {"active": 0, "normal_ratio_before": 0.0, "normal_ratio_after": 0.0, "suppression_ratio": 1.0, "mean_trust": 0.0, "mean_rho": 1.0}
+        return {
+            "active": 0,
+            "normal_ratio_before": 0.0,
+            "normal_ratio_after": 0.0,
+            "suppression_ratio": 1.0,
+            "mean_trust": 0.0,
+            "mean_rho": 1.0,
+        }
 
     gnorm = torch.linalg.vector_norm(grad, dim=-1)
     active_idx = torch.nonzero(gnorm > 1e-12, as_tuple=False).squeeze(-1)
     if active_idx.numel() == 0:
-        return {"active": 0, "normal_ratio_before": 0.0, "normal_ratio_after": 0.0, "suppression_ratio": 1.0, "mean_trust": 0.0, "mean_rho": 1.0}
+        return {
+            "active": 0,
+            "normal_ratio_before": 0.0,
+            "normal_ratio_after": 0.0,
+            "suppression_ratio": 1.0,
+            "mean_trust": 0.0,
+            "mean_rho": 1.0,
+        }
 
-    normal_before_sum, normal_after_sum, total_grad_sum, trust_sum, rho_sum, total = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    normal_before_sum = 0.0
+    normal_after_sum = 0.0
+    total_grad_sum = 0.0
+    trust_sum = 0.0
+    rho_sum = 0.0
+    total = 0
 
     for lo in range(0, active_idx.numel(), int(chunk_size)):
         ids = active_idx[lo:lo + int(chunk_size)]
@@ -101,6 +130,7 @@ def transform_xyz_gradient_inplace(gaussians, field, strength, rho_min=0.05, chu
         g_normal = gn_scalar * n
         g_tangent = g - g_normal
 
+        # At strength=0, rho=1 (vanilla); at strength=1 and trust=1, rho=rho_min.
         rho = 1.0 - float(strength) * trust * (1.0 - float(rho_min))
         g_new = g_tangent + rho * g_normal
         grad[ids] = g_new
@@ -117,19 +147,45 @@ def transform_xyz_gradient_inplace(gaussians, field, strength, rho_min=0.05, chu
         total += int(ids.numel())
 
     denom = max(total_grad_sum, 1e-12)
+    before_ratio = normal_before_sum / denom
+    after_ratio = normal_after_sum / denom
+    suppression = normal_after_sum / max(normal_before_sum, 1e-12)
+
     return {
         "active": total,
-        "normal_ratio_before": normal_before_sum / denom,
-        "normal_ratio_after": normal_after_sum / denom,
-        "suppression_ratio": normal_after_sum / max(normal_before_sum, 1e-12),
+        "normal_ratio_before": before_ratio,
+        "normal_ratio_after": after_ratio,
+        "suppression_ratio": suppression,
         "mean_trust": trust_sum / max(total, 1),
         "mean_rho": rho_sum / max(total, 1),
     }
 
+
 @torch.no_grad()
-def transform_xyz_gradient_evidence_inplace(gaussians, field, strength, rho_min=0.05, trust_threshold=0.78, trust_temperature=0.08, normal_need_beta=0.35, normal_need_clip=3.0, chunk_size=65536):
+def transform_xyz_gradient_evidence_inplace(
+    gaussians,
+    field,
+    strength,
+    rho_min=0.05,
+    trust_threshold=0.78,
+    trust_temperature=0.08,
+    normal_need_beta=0.35,
+    normal_need_clip=3.0,
+    chunk_size=65536,
+):
+    # Evidence-conditioned IM-GS.
     grad = gaussians._xyz.grad
-    empty = {"active": 0, "normal_ratio_before": 0.0, "normal_ratio_after": 0.0, "suppression_ratio": 1.0, "mean_geo_trust": 0.0, "mean_calibrated_trust": 0.0, "mean_effective_trust": 0.0, "mean_normal_need": 0.0, "mean_rho": 1.0}
+    empty = {
+        "active": 0,
+        "normal_ratio_before": 0.0,
+        "normal_ratio_after": 0.0,
+        "suppression_ratio": 1.0,
+        "mean_geo_trust": 0.0,
+        "mean_calibrated_trust": 0.0,
+        "mean_effective_trust": 0.0,
+        "mean_normal_need": 0.0,
+        "mean_rho": 1.0,
+    }
     if grad is None or strength <= 0:
         return empty
 
@@ -147,7 +203,15 @@ def transform_xyz_gradient_evidence_inplace(gaussians, field, strength, rho_min=
         normal_abs_chunks.append(torch.abs((g * n).sum(dim=-1)))
     normal_mean = torch.cat(normal_abs_chunks).mean().clamp_min(1e-12)
 
-    normal_before_sum, normal_after_sum, total_grad_sum, geo_sum, cal_sum, eff_sum, need_sum, rho_sum, total = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    normal_before_sum = 0.0
+    normal_after_sum = 0.0
+    total_grad_sum = 0.0
+    geo_sum = 0.0
+    cal_sum = 0.0
+    eff_sum = 0.0
+    need_sum = 0.0
+    rho_sum = 0.0
+    total = 0
     temp = max(float(trust_temperature), 1e-4)
 
     for lo in range(0, active_idx.numel(), int(chunk_size)):
@@ -162,7 +226,9 @@ def transform_xyz_gradient_evidence_inplace(gaussians, field, strength, rho_min=
 
         q_cal = torch.sigmoid((q_geo - float(trust_threshold)) / temp)
         normal_need = torch.abs(gn_scalar) / normal_mean
-        normal_need = torch.clamp(normal_need, min=0.0, max=float(normal_need_clip))
+        normal_need = torch.clamp(
+            normal_need, min=0.0, max=float(normal_need_clip)
+        )
         correction_gate = torch.exp(-float(normal_need_beta) * normal_need)
         q_eff = q_cal * correction_gate
 
