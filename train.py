@@ -39,7 +39,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        # PYTORCH26_CHECKPOINT_LOAD_PATCH
+        try:
+            (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        except TypeError:
+            (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -98,81 +102,93 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, is_train=True, iteration=iteration)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        Ll1 = l1_loss(image, gt_image)
-        ssim_value = ssim(image, gt_image)
-        loss = Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        
+        is_pseudo_view = getattr(viewpoint_cam, "is_pseudo", False)
+        pseudo_start = int(os.environ.get("PSEUDO_START", "0"))
+        # PSEUDO_DISTILL_LOSS_PATCH
+        if is_pseudo_view:
+            weight_mode = os.environ.get("PSEUDO_WEIGHT_MODE", "uniform")
+            pseudo_weight = viewpoint_cam.pseudo_weight.to(device=image.device, dtype=image.dtype).clamp(0.0, 1.0) if weight_mode == "qgeo" else torch.ones_like(image[:1])
+            pixel_l1 = torch.abs(image - gt_image).mean(dim=0, keepdim=True)
+            weighted_l1 = (pixel_l1 * pseudo_weight).sum() / (pseudo_weight.sum() + 1e-8)
+
+            view_conf = pseudo_weight.mean().detach()
+            pseudo_ramp = int(os.environ.get("PSEUDO_DISTILL_RAMP", "500"))
+            pseudo_max = float(os.environ.get("PSEUDO_LOSS_MAX", "0.35"))
+            pseudo_strength = min(max((iteration - pseudo_start) / float(pseudo_ramp), 0.0), 1.0) if pseudo_ramp > 0 else 1.0
+            
+            Ll1, ssim_value = weighted_l1, torch.zeros((), device=image.device)
+            loss = (pseudo_max * pseudo_strength) * view_conf * weighted_l1
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            ssim_value = ssim(image, gt_image)
+            loss = Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
         # IMGS_ALIGNMENT_LOSS_PATCH
-        if (
-            implicit_metric_field is not None
-            and os.environ.get("IMPLICIT_METRIC_ALIGN", "0") == "1"
-        ):
+        if implicit_metric_field is not None and os.environ.get("IMPLICIT_METRIC_ALIGN", "0") == "1":
             align_start = int(os.environ.get("IMPLICIT_METRIC_ALIGN_START", "1000"))
             align_end = int(os.environ.get("IMPLICIT_METRIC_ALIGN_END", "5000"))
             if iteration >= align_start and iteration <= align_end:
                 from implicit_metric_field import metric_strength
-                align_strength = metric_strength(
-                    iteration,
-                    int(os.environ.get("IMPLICIT_METRIC_START", "1000")),
-                    int(os.environ.get("IMPLICIT_METRIC_END", "5500")),
-                    int(os.environ.get("IMPLICIT_METRIC_RAMP", "750")),
-                )
-                sample_count = min(
-                    int(os.environ.get("IMPLICIT_METRIC_ALIGN_SAMPLES", "8192")),
-                    int(gaussians._xyz.shape[0]),
-                )
+                align_strength = metric_strength(iteration, int(os.environ.get("IMPLICIT_METRIC_START", "1000")), int(os.environ.get("IMPLICIT_METRIC_END", "5500")), int(os.environ.get("IMPLICIT_METRIC_RAMP", "750")))
+                sample_count = min(int(os.environ.get("IMPLICIT_METRIC_ALIGN_SAMPLES", "8192")), int(gaussians._xyz.shape[0]))
                 if sample_count > 0 and align_strength > 0:
-                    ids = torch.randint(
-                        0, gaussians._xyz.shape[0],
-                        (sample_count,), device=gaussians._xyz.device
-                    )
+                    ids = torch.randint(0, gaussians._xyz.shape[0], (sample_count,), device=gaussians._xyz.device)
                     with torch.no_grad():
-                        normal_target, align_trust = implicit_metric_field(
-                            gaussians._xyz.detach()[ids]
-                        )
+                        normal_target, align_trust = implicit_metric_field(gaussians._xyz.detach()[ids])
+
+                    from utils.general_utils import build_rotation
                     rot = build_rotation(gaussians._rotation[ids])
                     scales = gaussians.get_scaling[ids]
+
                     shortest = torch.argmin(scales, dim=-1)
                     gather_idx = shortest[:, None, None].expand(-1, 3, 1)
                     shortest_axis = torch.gather(rot, 2, gather_idx).squeeze(-1)
-                    cos2 = (shortest_axis * normal_target).sum(
-                        dim=-1, keepdim=True
-                    ).pow(2)
-                    align_loss = (
-                        align_trust.detach() * (1.0 - cos2)
-                    ).sum() / (align_trust.detach().sum() + 1e-8)
-                    loss = loss + (
-                        float(os.environ.get(
-                            "IMPLICIT_METRIC_ALIGN_LAMBDA", "0.005"
-                        ))
-                        * float(align_strength)
-                        * align_loss
-                    )
+                    cos2 = (shortest_axis * normal_target).sum(dim=-1, keepdim=True).pow(2)
+
+                    shape_mode = os.environ.get("IMPLICIT_COVARIANCE_MODE", "legacy_align")
+
+                    if shape_mode == "joint":
+                        trust_threshold = float(os.environ.get("SHAPE_TRUST_THRESHOLD", "0.78"))
+                        trust_temperature = max(float(os.environ.get("SHAPE_TRUST_TEMPERATURE", "0.08")), 1e-4)
+                        q_cal = torch.sigmoid((align_trust - trust_threshold) / trust_temperature)
+
+                        opacity_support = gaussians.get_opacity.detach()[ids]
+                        opacity_floor = float(os.environ.get("SHAPE_OPACITY_FLOOR", "0.25"))
+                        support = opacity_floor + (1.0 - opacity_floor) * opacity_support
+                        shape_w = (q_cal * support).detach()
+
+                        align_loss = (shape_w * (1.0 - cos2)).sum() / (shape_w.sum() + 1e-8)
+
+                        n_local = torch.bmm(rot.transpose(1, 2), normal_target.unsqueeze(-1)).squeeze(-1)
+                        scales2 = scales.pow(2)
+                        normal_var = (n_local.pow(2) * scales2).sum(dim=-1, keepdim=True)
+                        total_var = scales2.sum(dim=-1, keepdim=True)
+                        tangent_var = ((total_var - normal_var).clamp_min(1e-10) / 2.0)
+                        thickness_ratio = torch.sqrt((normal_var + 1e-10) / (tangent_var + 1e-10))
+                        max_ratio = float(os.environ.get("THICKNESS_MAX_RATIO", "0.45"))
+                        excess = torch.clamp(thickness_ratio - max_ratio, min=0.0)
+                        thickness_loss = (shape_w * excess.pow(2)).sum() / (shape_w.sum() + 1e-8)
+
+                        loss = loss + (float(os.environ.get("IMPLICIT_METRIC_ALIGN_LAMBDA", "0.005")) * float(align_strength) * align_loss)
+                        loss = loss + (float(os.environ.get("THICKNESS_LAMBDA", "0.002")) * float(align_strength) * thickness_loss)
+                    else:
+                        align_loss = (align_trust.detach() * (1.0 - cos2)).sum() / (align_trust.detach().sum() + 1e-8)
+                        loss = loss + (float(os.environ.get("IMPLICIT_METRIC_ALIGN_LAMBDA", "0.005")) * float(align_strength) * align_loss)
 
         loss.backward()
 
         # IMGS_GRADIENT_METRIC_PATCH
         if implicit_metric_field is not None:
-            from implicit_metric_field import (
-                metric_strength,
-                transform_xyz_gradient_evidence_inplace,
-            )
-            metric_s = metric_strength(
-                iteration,
-                int(os.environ.get("IMPLICIT_METRIC_START", "1000")),
-                int(os.environ.get("IMPLICIT_METRIC_END", "5500")),
-                int(os.environ.get("IMPLICIT_METRIC_RAMP", "750")),
-            )
+            from implicit_metric_field import metric_strength, transform_xyz_gradient_evidence_inplace
+            metric_s = metric_strength(iteration, int(os.environ.get("IMPLICIT_METRIC_START", "1000")), int(os.environ.get("IMPLICIT_METRIC_END", "5500")), int(os.environ.get("IMPLICIT_METRIC_RAMP", "750")))
             metric_stats = transform_xyz_gradient_evidence_inplace(
-                gaussians=gaussians,
-                field=implicit_metric_field,
-                strength=metric_s,
+                gaussians=gaussians, field=implicit_metric_field, strength=metric_s,
                 rho_min=float(os.environ.get("IMPLICIT_METRIC_RHO_MIN", "0.05")),
                 trust_threshold=float(os.environ.get("EC_TRUST_THRESHOLD", "0.78")),
                 trust_temperature=float(os.environ.get("EC_TRUST_TEMPERATURE", "0.08")),
                 normal_need_beta=float(os.environ.get("EC_NORMAL_NEED_BETA", "0.35")),
                 normal_need_clip=float(os.environ.get("EC_NORMAL_NEED_CLIP", "3.0")),
-                chunk_size=int(os.environ.get("IMPLICIT_METRIC_CHUNK", "65536")),
+                chunk_size=int(os.environ.get("IMPLICIT_METRIC_CHUNK", "65536"))
             )
             log_interval = int(os.environ.get("IMPLICIT_METRIC_LOG_INTERVAL", "100"))
             if metric_s > 0 and iteration % max(log_interval, 1) == 0:
