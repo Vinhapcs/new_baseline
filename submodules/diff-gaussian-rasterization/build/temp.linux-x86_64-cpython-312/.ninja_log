@@ -1,0 +1,6 @@
+# ninja log v7
+1	10491	1788256641406966767	/kaggle/working/dropgaussian_paper_ablation/DropGaussian_release/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-312/cuda_rasterizer/forward.o	a29a4ea46bddb632
+1	10542	1788256641406966767	/kaggle/working/dropgaussian_paper_ablation/DropGaussian_release/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-312/cuda_rasterizer/backward.o	219f81e589390916
+1	28031	1788256641406966767	/kaggle/working/dropgaussian_paper_ablation/DropGaussian_release/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-312/cuda_rasterizer/rasterizer_impl.o	7059e7db193c1009
+2	40520	1788256641407966839	/kaggle/working/dropgaussian_paper_ablation/DropGaussian_release/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-312/ext.o	8ff10c63bcd30533
+2	67768	1788256641407966839	/kaggle/working/dropgaussian_paper_ablation/DropGaussian_release/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-312/rasterize_points.o	2503a5813a44200f

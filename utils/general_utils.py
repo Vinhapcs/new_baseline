@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import os
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -127,7 +128,9 @@ def safe_state(silent):
 
     sys.stdout = F(silent)
 
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
+    # DROPGAUSSIAN_SEED_PATCH
+    experiment_seed = int(os.environ.get("EXPERIMENT_SEED", "0"))
+    random.seed(experiment_seed)
+    np.random.seed(experiment_seed)
+    torch.manual_seed(experiment_seed)
     torch.cuda.set_device(torch.device("cuda:0"))

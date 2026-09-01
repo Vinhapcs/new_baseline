@@ -214,21 +214,21 @@ class GaussianModel:
 
     # STEREOGS_ADAPTIVE_OPACITY_DECAY_METHOD_PATCH
     def adaptive_opacity_decay(self, min_decay_rate=0.99, sensitivity=0.5):
+        # StereoGS formula, with profiling-only cuda.synchronize/logging omitted.
         if self._opacity.grad is None:
             return
 
-        # Normalize gradients
         grad_norm = torch.norm(self._opacity.grad, dim=-1, keepdim=True)
         avg_grad = grad_norm.mean()
         normalized_grad = grad_norm / (avg_grad + 1e-8)
 
-        # Calculate decay factor: low grad -> min_decay_rate, high grad -> 1.0
+        # low grad -> factor approaches min_decay_rate
+        # high grad -> factor approaches 1.0
         penalty_strength = 1.0 - min_decay_rate
         decay_factor = 1.0 - penalty_strength * torch.exp(
             -sensitivity * normalized_grad
         )
 
-        # Apply decay and activation
         new_opacity = self.get_opacity * decay_factor
         new_opacity = torch.clamp(new_opacity, min=1e-6, max=1.0 - 1e-6)
         self._opacity.data = self.inverse_opacity_activation(new_opacity)

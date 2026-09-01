@@ -184,10 +184,12 @@ def readColmapSceneInfo(path, images, eval, n_views=3, llffhold=8):
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
+    # DROPGAUSSIAN_STRICT_INIT_PATCH
     if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        xyz, rgb, _ = read_points3D_binary(bin_path)
-        storePly(ply_path, xyz, rgb)
+        raise FileNotFoundError(
+            f"Required limited-view initialization is missing: {ply_path}. "
+            "Build the MASt3R initialization first; all-view fallback is disabled."
+        )
     pcd = fetchPly(ply_path)
 
     reading_dir = "images" if images == None else images
@@ -198,18 +200,35 @@ def readColmapSceneInfo(path, images, eval, n_views=3, llffhold=8):
                              images_folder=os.path.join(path, reading_dir),  path=path, rgb_mapping=rgb_mapping)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    if eval:
+    # DROPGAUSSIAN_SPLIT_MANIFEST_PATCH
+    if eval and n_views > 0:
+        split_path = os.path.join(path, f"split_{n_views}.json")
+        if not os.path.exists(split_path):
+            raise FileNotFoundError(f"Required camera split is missing: {split_path}")
+        with open(split_path, "r", encoding="utf-8") as split_handle:
+            split = json.load(split_handle)
+        train_names = split.get("train_names", [])
+        test_names = split.get("test_names", [])
+        if split.get("n_views") != n_views or split.get("llff_hold") != llffhold:
+            raise RuntimeError(f"Camera protocol mismatch in {split_path}")
+        if len(train_names) != n_views or set(train_names) & set(test_names):
+            raise RuntimeError(f"Invalid train/test camera split in {split_path}")
+        cameras_by_name = {os.path.basename(camera.image_path): camera for camera in cam_infos}
+        missing = (set(train_names) | set(test_names)) - set(cameras_by_name)
+        if missing:
+            raise RuntimeError(f"Split references missing cameras: {sorted(missing)}")
+        train_cam_infos = [cameras_by_name[name] for name in train_names]
+        test_cam_infos = [cameras_by_name[name] for name in test_names]
+    elif eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
-
-    if n_views > 0:
-        idx_sub = np.linspace(0, len(train_cam_infos)-1, n_views)
-        idx_sub = [round(i) for i in idx_sub]
-        train_cam_infos = [c for idx, c in enumerate(train_cam_infos) if idx in idx_sub]
-        assert len(train_cam_infos) == n_views
+        if n_views > 0:
+            idx_sub = [round(i) for i in np.linspace(0, len(train_cam_infos)-1, n_views)]
+            train_cam_infos = [c for idx, c in enumerate(train_cam_infos) if idx in idx_sub]
+            assert len(train_cam_infos) == n_views
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
     scene_info = SceneInfo(point_cloud=pcd,

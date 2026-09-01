@@ -1,0 +1,4 @@
+# ninja log v7
+1	19858	1788256717501474602	/kaggle/working/dropgaussian_paper_ablation/DropGaussian_release/submodules/simple-knn/build/temp.linux-x86_64-cpython-312/simple_knn.o	e2da51bfcf248a61
+0	37153	1788256717500474529	/kaggle/working/dropgaussian_paper_ablation/DropGaussian_release/submodules/simple-knn/build/temp.linux-x86_64-cpython-312/ext.o	9580ddc7f83744b
+1	62443	1788256717501474602	/kaggle/working/dropgaussian_paper_ablation/DropGaussian_release/submodules/simple-knn/build/temp.linux-x86_64-cpython-312/spatial.o	57c84d39315ca61

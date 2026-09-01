@@ -127,6 +127,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     bg_mask = None
     loss_accum = 0
+    pseudo_stack = None
     for iteration in range(first_iter, opt.iterations + 1):        
         iter_start.record()
 
@@ -226,7 +227,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1 = l1_loss(image, gt_image)
             ssim_value = ssim(image, gt_image)
             loss = Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-
+        
         # IMGS_ALIGNMENT_LOSS_PATCH
         if (
             implicit_metric_field is not None
@@ -415,18 +416,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "mode": "evidence",
                     **metric_stats,
                 })
+
         iter_end.record()
 
         with torch.no_grad():
-            # IMGS_OPACITY_DECAY_WINDOW_PATCH
-            if os.environ.get("STEREOGS_OPACITY_DECAY_ENABLED", "0") == "1":
-                decay_end = int(os.environ.get("STEREOGS_OPACITY_DECAY_END", "0"))
-                if decay_end <= 0 or iteration <= decay_end:
-                    gaussians.adaptive_opacity_decay(
-                        min_decay_rate=float(os.environ.get("STEREOGS_OPACITY_DECAY_FACTOR", "0.99")),
-                        sensitivity=float(os.environ.get("STEREOGS_GRAD_SENSITIVITY", "0.5")),
-                    )
-
             # Progress bar
             if iteration > opt.densify_from_iter:
                 loss_accum += loss.clone().detach().item()
@@ -443,7 +436,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-
                 # IMGS_METRIC_STATS_SAVE_PATCH
                 if implicit_metric_field is not None:
                     stats_path = os.path.join(
@@ -451,6 +443,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     )
                     torch.save(metric_stats_history, stats_path)
                     print("Saved IM-GS metric stats:", stats_path)
+
+            # STEREOGS_ADAPTIVE_OPACITY_DECAY_TRAIN_PATCH
+            # IMGS_OPACITY_DECAY_WINDOW_PATCH
+            if os.environ.get("STEREOGS_OPACITY_DECAY_ENABLED", "0") == "1":
+                decay_end = int(os.environ.get("STEREOGS_OPACITY_DECAY_END", "0"))
+                if decay_end <= 0 or iteration <= decay_end:
+                    gaussians.adaptive_opacity_decay(
+                        min_decay_rate=float(os.environ.get("STEREOGS_OPACITY_DECAY_FACTOR", "0.99")),
+                        sensitivity=float(os.environ.get("STEREOGS_GRAD_SENSITIVITY", "0.5")),
+                    )
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -567,7 +569,11 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    # DROPGAUSSIAN_MEMORY_PATCH
+    torch.cuda.reset_peak_memory_stats()
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    print("PEAK_ALLOCATED_GB={:.6f}".format(torch.cuda.max_memory_allocated() / 2**30))
+    print("PEAK_RESERVED_GB={:.6f}".format(torch.cuda.max_memory_reserved() / 2**30))
 
     # All done
     print("\nTraining complete.")
